@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "outDir": "./dist/out-tsc",
+    "module": "CommonJS",
+    "strict": true,
+    "strictPropertyInitialization": false,
+    "experimentalDecorators": true,
+    "moduleResolution": "bundler",
+    "target": "ES2022",
+    "useDefineForClassFields": false,
+    "baseUrl": "./",
+    "types": ["jasmine"],
+    "paths": {
+      "@core/*": ["src/app/core/*"],
+      "@features/*": ["src/app/features/*"],
+      "@shared/*": ["src/app/shared/*"]
+    }
+  },
+  "include": ["src/**/*.spec.ts", "src/**/*.d.ts"]
+}
