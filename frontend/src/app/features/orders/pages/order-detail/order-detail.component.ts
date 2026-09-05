@@ -35,7 +35,7 @@ import {
 import { ActivatedRoute, RouterLink } from '@angular/router';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { filter, switchMap, tap } from 'rxjs';
-import { DatePipe } from '@angular/common';
+import { DatePipe, DecimalPipe } from '@angular/common';
 import { ApiService } from '../../../../core/services/api.service';
 import { WebSocketService } from '../../../../core/services/websocket.service';
 import { NotificationService } from '../../../../core/services/notification.service';
@@ -46,7 +46,7 @@ import { StatusBadgePipe, StatusProgressPipe } from '../../../../shared/pipes/st
   selector: 'app-order-detail',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, StatusBadgePipe, StatusProgressPipe, DatePipe],
+  imports: [RouterLink, StatusBadgePipe, StatusProgressPipe, DatePipe, DecimalPipe],
   template: `
     <div class="page-header">
       <div>
@@ -250,31 +250,52 @@ export class OrderDetailComponent implements OnInit {
     // open a new one for the new orderId.
     const id = this.orderId();
     if (id) {
-      this.ws
-        .connectOrder(id)
-        .pipe(
-          tap(() => this.wsConnected.set(true)),
-          filter((event) => event.event_type === 'OrderStatusChanged'),
-          tap((event) => {
-            // Update the order status signal directly — no HTTP request needed
+      this.ws.connectOrder(id).subscribe({
+        next: (event) => {
+          console.log('📥 [OrderDetail] WS NEXT:', event);
+
+          if (event.event_type === 'Connected') {
+            this.wsConnected.set(true);
+            return;
+          }
+
+          if (
+            event.event_type === 'ProcessingStarted' ||
+            event.event_type === 'OrderCompleted' ||
+            event.event_type === 'OrderFailed'
+          ) {
+            console.log(
+              '✅ [OrderDetail] STATUS UPDATE:',
+              event.order_id,
+              event.event_type,
+              event.status
+            );
+
             if (event.status) {
               this.order.update((o) =>
-                o ? { ...o, status: event.status!, updated_at: event.timestamp || o.updated_at } : null
+                o
+                  ? {
+                      ...o,
+                      status: event.status!,
+                      updated_at: event.timestamp || o.updated_at,
+                    }
+                  : null
               );
+
               this.lastEventTime.set(event.timestamp || null);
-
-              // Show notification on status change
-              this.notify.info(
-                `Order #${id} is now ${event.status}`
-              );
-
-              // Reload events timeline to show new event
               this.refreshEvents();
             }
-          }),
-          takeUntilDestroyed()
-        )
-        .subscribe();
+          }
+        },
+
+        error: (err) => {
+          console.error('❌ [OrderDetail] WS ERROR:', err);
+        },
+
+        complete: () => {
+          console.log('🛑 [OrderDetail] WS COMPLETED');
+        },
+      });
     }
   }
 

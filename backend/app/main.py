@@ -18,7 +18,14 @@ from fastapi.responses import JSONResponse
 
 from app.config import get_settings
 from app.database import engine
+
+import asyncio
+
 from app.kafka_client import close_producer, get_producer
+from workers.websocket_event_consumer import (
+    consume_order_status_events,
+)
+
 from app.models import Base
 from app.routers import dashboard, orders, websocket
 from app.schemas import HealthResponse
@@ -49,25 +56,48 @@ logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.I
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    # Startup
-    # Auto-create tables in development (production uses Alembic migrations).
+
     if settings.environment == "development":
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
-    # Warm up the Kafka producer so the first order creation is fast.
+    # ── Kafka producer ───────────────────────────────────────────────
     try:
         await get_producer()
-        logging.getLogger(__name__).info("Kafka producer started")
+        logging.getLogger(__name__).info(
+            "Kafka producer started"
+        )
     except Exception as exc:
-        logging.getLogger(__name__).warning(f"Kafka producer not available at startup: {exc}")
+        logging.getLogger(__name__).warning(
+            f"Kafka producer not available at startup: {exc}"
+        )
 
-    yield  # ← application runs here
+    # ── Kafka → WebSocket bridge ───────────────────────────────────
+    status_consumer_task = asyncio.create_task(
+        consume_order_status_events()
+    )
 
-    # Shutdown
-    await close_producer()
-    await engine.dispose()
+    logging.getLogger(__name__).info(
+        "Kafka WebSocket status consumer started"
+    )
 
+    try:
+        yield
+
+    finally:
+        # Stop Kafka consumer
+        status_consumer_task.cancel()
+
+        try:
+            await status_consumer_task
+        except asyncio.CancelledError:
+            pass
+
+        # Stop producer
+        await close_producer()
+
+        # Close database
+        await engine.dispose()
 
 # ── App factory ───────────────────────────────────────────────────────────────
 

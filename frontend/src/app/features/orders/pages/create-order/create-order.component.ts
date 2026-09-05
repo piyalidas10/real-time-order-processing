@@ -39,12 +39,13 @@ import {
 import { tap, catchError, EMPTY } from 'rxjs';
 import { ApiService } from '../../../../core/services/api.service';
 import { NotificationService } from '../../../../core/services/notification.service';
+import { DecimalPipe } from '@angular/common';
 
 @Component({
   selector: 'app-create-order',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule],
+  imports: [ReactiveFormsModule, DecimalPipe],
   template: `
     <div class="page-header">
       <h1 class="page-title">➕ Create New Order</h1>

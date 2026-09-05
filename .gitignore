@@ -1,0 +1,27 @@
+# Node
+node_modules/
+/frontend/**/node_modules/
+.npm/
+/frontend/.angular/
+/frontend/dist/
+/frontend/coverage/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

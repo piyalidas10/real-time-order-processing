@@ -58,10 +58,10 @@ from app.kafka_client import (
     TOPIC_ORDER_CREATED_DLQ,
     TOPIC_ORDER_FAILED,
     TOPIC_ORDER_PROCESSED,
+    TOPIC_ORDER_STATUS_CHANGED,
     publish_event,
 )
 from app.models import Order, OrderEvent, OrderStatus, ProcessedEvent
-from app.websocket_manager import ws_manager
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -126,12 +126,16 @@ async def process_order_event(event: dict) -> None:
         await db.commit()
 
         # Broadcast real-time update via WebSocket
-        await ws_manager.broadcast_order_event(order_id, {
-            "event_type": "OrderStatusChanged",
-            "order_id": order_id,
-            "status": "PROCESSING",
-            "timestamp": now.isoformat(),
-        })
+        await publish_event(
+            topic=TOPIC_ORDER_STATUS_CHANGED,
+            event={
+                "event_type": "ProcessingStarted",
+                "order_id": order_id,
+                "status": "PROCESSING",
+                "timestamp": now.isoformat(),
+            },
+            key=str(order_id),
+        )
         logger.info(f"Order {order_id} → PROCESSING")
 
         # ── Simulate business logic ──────────────────────────────────────────
@@ -153,12 +157,16 @@ async def process_order_event(event: dict) -> None:
             await db2.commit()
 
         completed_at = datetime.now(timezone.utc)
-        await ws_manager.broadcast_order_event(order_id, {
-            "event_type": "OrderStatusChanged",
-            "order_id": order_id,
-            "status": "COMPLETED",
-            "timestamp": completed_at.isoformat(),
-        })
+        await publish_event(
+            topic=TOPIC_ORDER_STATUS_CHANGED,
+            event={
+                "event_type": "OrderCompleted",
+                "order_id": order_id,
+                "status": "COMPLETED",
+                "timestamp": completed_at.isoformat(),
+            },
+            key=str(order_id),
+        )
         logger.info(f"Order {order_id} → COMPLETED")
 
         # ── Publish order.processed ──────────────────────────────────────────
@@ -192,13 +200,17 @@ async def handle_failed_order(order_id: int, event: dict, error: str) -> None:
             ))
             await db.commit()
 
-    await ws_manager.broadcast_order_event(order_id, {
-        "event_type": "OrderStatusChanged",
-        "order_id": order_id,
-        "status": "FAILED",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "error": error,
-    })
+    await publish_event(
+        topic=TOPIC_ORDER_STATUS_CHANGED,
+        event={
+            "event_type": "OrderFailed",
+            "order_id": order_id,
+            "status": "FAILED",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "error": error,
+        },
+        key=str(order_id),
+    )
 
     # Publish to DLQ so the message can be inspected / replayed
     await publish_event(

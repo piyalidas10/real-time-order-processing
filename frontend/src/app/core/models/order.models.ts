@@ -68,9 +68,16 @@ export interface CreateOrderPayload {
 }
 
 // ── WebSocket events ──────────────────────────────────────────────────────────
+export type WebSocketEventType =
+  | 'OrderCreated'
+  | 'ProcessingStarted'
+  | 'OrderCompleted'
+  | 'OrderFailed'
+  | 'Connected'
+  | 'Ping';
 
 export interface WebSocketEvent {
-  event_type: 'OrderStatusChanged' | 'Connected' | 'Ping';
+  event_type: WebSocketEventType;
   order_id?: number;
   status?: OrderStatus;
   timestamp?: string;

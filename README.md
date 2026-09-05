@@ -2,6 +2,8 @@
 
 A **production-style, full-stack learning application** demonstrating how a modern Angular 21 frontend communicates with an event-driven Python backend through REST, WebSocket, Apache Kafka, and the Transactional Outbox Pattern.
 
+<img src="img/complete_order_websocket.png" width="90%" />
+
 ```
 Angular 21  ──REST──▶  FastAPI  ──▶  PostgreSQL
     │                                    │
@@ -24,24 +26,429 @@ The user creates an order and watches it transition from **PENDING → PROCESSIN
 
 ## Quick Start
 
-```bash
-# 1. Copy environment config
-cp .env.example .env
+1. Create .env
+2. Then put this into .env:
+```
+POSTGRES_USER=orderuser
+POSTGRES_PASSWORD=orderpassword
+POSTGRES_DB=orderdb
+DATABASE_URL=postgresql+asyncpg://orderuser:orderpassword@postgres:5432/orderdb
+DATABASE_URL_SYNC=postgresql://orderuser:orderpassword@postgres:5432/orderdb
+KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+ENVIRONMENT=development
+```
+3. If package-lock.json is not present inside frontend folder. 
+```
+cd frontend
+npm i
+```
+4. Start everything
+```
+# Validate Compose
+docker compose config
 
-# 2. Start everything
+# Build + start
+docker compose up --build 
+or
+docker compose build
+docker compose up
+```
+
+| Command                     |                  Build image | Start containers |
+| --------------------------- | ---------------------------: | ---------------: |
+| `docker compose build`      |                            ✅ |                ❌ |
+| `docker compose up`         | Usually uses existing images |                ✅ |
+| `docker compose up --build` |                            ✅ |                ✅ |
+
+4. Open the app
+
+| Component       | URL                                                          |
+| --------------- | ------------------------------------------------------------ |
+| Angular         | [http://localhost:4200](http://localhost:4200)               |
+| Kafka UI        | [http://localhost:8080](http://localhost:8080)               |
+| FastAPI Swagger | [http://localhost:8000/docs](http://localhost:8000/docs)     |
+| FastAPI Health  | [http://localhost:8000/health](http://localhost:8000/health) |
+| PostgreSQL      | localhost:5432                                               |
+| Kafka           | localhost:9092                                               |
+
+Note : Don't open localhost:5432 in Chrome. PostgreSQL does not speak HTTP.
+
+5. Rebuild + start again
+```
+docker compose down -v
 docker compose up --build
-
-# 3. Open the app
-open http://localhost:4200          # Angular UI
-open http://localhost:8080          # Kafka UI
-open http://localhost:8000/docs     # FastAPI Swagger
 ```
 
 **No local Node.js, Python, PostgreSQL, or Kafka installation required.**
 
+6. You will see, The outbox-worker is repeatedly polling PostgreSQL:
+Docker continuously showing logs is normal. Your outbox-worker is designed as a long-running worker and will keep polling PostgreSQL every few seconds.
+
+What you're seeing:
+```
+SELECT ... FROM outbox_events
+WHERE status = 'PENDING'
+...
+ROLLBACK
+```
+means:
+```
+"Check whether there are any new PENDING events."
+```
+Since both events are already:
+```
+1 → PUBLISHED
+2 → PUBLISHED
+```
+there is nothing for the outbox worker to process, so it waits and checks again.
+
+That means:
+```
+Outbox Worker
+     │
+     ▼
+Check PostgreSQL
+     │
+     ▼
+Are there PENDING events?
+     │
+     ├── YES → publish to Kafka → mark as published
+     │
+     └── NO  → wait → check again
+                    │
+                    └── repeat
+```
+So the terminal will not return to the PowerShell prompt because the worker is designed to run continuously.
+
+7. Check DB - See it directly from Docker
+
+You don't need any GUI just to verify it.
+```
+docker compose exec postgres psql -U orderuser -d orderdb
+```
+Then:
+```
+\dt
+```
+This shows your tables.
+
+For example:
+```
+        List of relations
+ Schema |     Name      | Type  |   Owner
+--------+---------------+-------+----------
+ public | orders        | table | orderuser
+ public | order_items   | table | orderuser
+```
+To see the data:
+```
+SELECT * FROM orders;
+```
+To see the database:
+```
+\l
+```
+To see the tables' structure:
+```
+\d orders
+```
+
+8. If you chec DB table through UI
+
+**Option 1 — pgAdmin**
+
+Install/open pgAdmin, then create a server connection:
+```
+Host:     localhost
+Port:     5432
+Database: orderdb
+Username: orderuser
+Password: orderpassword
+```
+After connecting:
+```
+Servers
+ └── PostgreSQL
+      └── Databases
+           └── orderdb
+                ├── Schemas
+                │    └── public
+                │         └── Tables
+                │              ├── orders
+                │              ├── order_items
+                │              └── ...
+                └── ...
+```
+You can then right-click a table → View/Edit Data.
+
+**Option 2 — DBeaver**
+
+DBeaver is also very good for development.
+
+Connection:
+```
+Host: localhost
+Port: 5432
+Database: orderdb
+User: orderuser
+Password: orderpassword
+```
+
+| Service         | Expected behavior                              |
+| --------------- | ---------------------------------------------- |
+| `outbox-worker` | ♻️ Runs forever, repeatedly polls DB           |
+| `order-worker`  | ♻️ Runs forever, waits/consumes Kafka messages |
+| `notif-worker`  | ♻️ Runs forever, waits/consumes Kafka messages |
+| `api`           | 🌐 Runs forever, serves HTTP requests          |
+| `postgres`      | 🗄️ Runs forever                               |
+| `kafka`         | 📨 Runs forever                                |
+
+## Make change in the code - Check the Steps
+Rebuild full application root, run:
+```
+docker compose up -d --build
+```
+
+Rebuild and restart only the api service
+```
+docker compose up -d --build api
+```
+
+if you have changed both API and worker code
+```
+docker compose up -d --build api worker
+```
+
+**Recommended sequence**
+```
+# 1. Stop existing containers
+docker compose down
+
+# 2. Rebuild images with your latest code
+docker compose build
+
+# 3. Start everything
+docker compose up -d
+```
+
+Or simply do it in one command:
+```
+docker compose up -d --build
+```
+
 ---
 
+## Check Status of Particular Oder
+```
+docker exec -it order-processing-system-postgres-1 psql -U orderuser -d orderdb -c "SELECT id, order_id, event_type, status, created_at FROM order_events WHERE order_id = 9 ORDER BY created_at;"
+```
+
+ id | order_id |    event_type     |   status   |          created_at
+----+----------+-------------------+------------+-------------------------------
+ 33 |        9 | OrderCreated      | PENDING    | 2026-09-05 13:27:39.237189+00
+ 34 |        9 | ProcessingStarted | PROCESSING | 2026-09-05 13:27:41.356493+00
+ 35 |        9 | OrderCompleted    | COMPLETED  | 2026-09-05 13:27:42.520761+00
+(3 rows)
+
+## After creating order -  your flow becomes:
+```
+                 CREATE ORDER
+                      │
+                      ▼
+              OrderCreated/PENDING
+                      │
+                      ▼
+                  Kafka
+                      │
+                      ▼
+              Background Worker
+                      │
+             ┌────────┴────────┐
+             ▼                 ▼
+        PostgreSQL         WebSocket
+             │                 │
+             │          ProcessingStarted
+             │          status=PROCESSING
+             │                 │
+             │                 ▼
+             │          Angular Signal
+             │                 │
+             │                 ▼
+             │          Progress = 50%
+             │
+             ▼
+          COMPLETED
+             │
+             ├──────────────► WebSocket
+             │                OrderCompleted
+             │                status=COMPLETED
+             │                     │
+             │                     ▼
+             │               Angular Signal
+             │                     │
+             │                     ▼
+             │               Progress = 100%
+```
+So the UI should visibly transition:
+> **PENDING → PROCESSING → COMPLETED**
+
+## Why your logs look different
+
+**For `outbox-worker`, you're seeing:**
+```
+SELECT ... FROM outbox_events
+WHERE status = 'PENDING'
+...
+ROLLBACK
+```
+That is normal.
+
+**It means:**
+```
+outbox-worker
+     ↓
+Check DB for PENDING events
+     ↓
+No new events
+     ↓
+sleep
+     ↓
+Check again
+     ↓
+No new events
+     ↓
+sleep
+     ↓
+...
+```
+So it should not stop.
+
+**`order-worker` is different**
+
+**You should see something like:**
+```
+Order worker started, waiting for messages...
+Subscribed to topic order.created
+Joined group 'order-worker-group'
+Successfully synced group
+Setting newly assigned partitions...
+```
+
+**And then it may appear to do nothing:**
+```
+Order worker started, waiting for messages...
+Joined group...
+Assigned partitions...
+```
+That's also normal.
+
+**It is essentially doing:**
+```
+order-worker
+     ↓
+WAIT for Kafka message
+     ↓
+WAIT...
+     ↓
+WAIT...
+     ↓
+Kafka message arrives
+     ↓
+process order
+     ↓
+WAIT again
+     ↓
+...
+```
+
+**It doesn't need to continuously print:**
+```
+Consuming...
+Consuming...
+Consuming...
+```
+unless you explicitly add logging for that.
+
+## Kafka → worker → PostgreSQL → frontend real-time update flow
+```
+Angular
+   │
+   │ POST /orders
+   ▼
+FastAPI
+   │
+   │ save order = PENDING
+   ▼
+PostgreSQL
+   │
+   │ Outbox record
+   ▼
+Outbox Worker
+   │
+   │ Kafka event
+   ▼
+Kafka
+   │
+   ▼
+Order Worker
+   │
+   │ update DB
+   ▼
+PostgreSQL
+   │
+   │ PROCESSING / COMPLETED
+   ▼
+WebSocket / polling
+   │
+   ▼
+Angular
+```
+
 ## Architecture Overview
+```
+Angular 21
+   │
+   │ POST /orders
+   ▼
+FastAPI
+   │
+   ├── orders → PENDING
+   └── outbox_events → PENDING
+                 │
+                 ▼
+           outbox-worker
+                 │
+                 ▼
+              Kafka
+          order.created
+                 │
+                 ▼
+           order-worker
+                 │
+       ┌─────────┴─────────┐
+       ▼                   ▼
+  PROCESSING           COMPLETED
+       │                   │
+       └─────────┬─────────┘
+                 ▼
+             PostgreSQL
+```
+**And your supporting tables give you:**
+```
+orders
+    └── current state
+
+order_events
+    └── state/event history
+
+outbox_events
+    └── reliable Kafka publishing
+
+processed_events
+    └── idempotency / duplicate protection
+```
+<img src="img/DBeaver_DB_Table.png" width="90%" />
+<img src="img/DBeaver_DB_Table_Order_Completed.png" width="90%" />
 
 ### Overall Architecture
 
@@ -208,120 +615,6 @@ erDiagram
 
 ---
 
-## Core Concepts Explained
-
-### Why the Transactional Outbox Pattern?
-
-**The dual-write problem:** If you do this:
-
-```python
-# ❌ DANGEROUS — these are two separate operations
-db.add(order)
-db.commit()
-kafka.publish("order.created", order)  # What if THIS crashes?
-```
-
-A crash between `db.commit()` and `kafka.publish()` leaves the order in the DB but no Kafka message was sent — the order silently never gets processed.
-
-**The fix — Transactional Outbox:**
-
-```python
-# ✅ SAFE — both happen in ONE database transaction
-async with db:
-    db.add(order)                          # INSERT order
-    db.add(OutboxEvent(payload=order_data)) # INSERT outbox_event
-    await db.commit()                      # COMMIT BOTH or NEITHER
-# Outbox Worker reads outbox_events and publishes to Kafka independently
-```
-
-Either both the order AND the outbox event are committed, or neither is. The Outbox Worker retries publishing until it succeeds.
-
-### Why Idempotency in Kafka Consumers?
-
-Kafka guarantees **at-least-once delivery** — a message may be delivered more than once if the consumer crashes after processing but before committing the offset.
-
-Without idempotency, the same order would be processed twice:
-
-```
-# ❌ Without idempotency
-Kafka delivers order.created for order #1001
-Worker processes order #1001 → COMPLETED
-Worker CRASHES before committing offset
-Kafka re-delivers order.created for order #1001  ← DUPLICATE
-Worker processes order #1001 AGAIN → double charge?
-```
-
-**Fix — check `processed_events` table:**
-
-```python
-# ✅ With idempotency
-if await is_already_processed(event_id, consumer_name):
-    return  # Skip — already handled
-process_order(event)
-mark_processed(event_id, consumer_name)  # Record in same transaction
-```
-
-### Why Separate Workers from the API?
-
-| API (FastAPI)         | Workers (Python processes) |
-|-----------------------|---------------------------|
-| Handles HTTP requests | Handles Kafka messages     |
-| Must respond fast (<200ms) | Can take seconds/minutes |
-| Stateless, horizontally scalable | Scale independently |
-| Unavailability = user error | Unavailability = delayed processing |
-
-Putting long-running work (payment processing, notifications) in the API request would:
-1. Make requests slow
-2. Tie API availability to Kafka availability
-3. Prevent independent scaling
-
-### Angular Signals vs RxJS
-
-| Use Signals for... | Use RxJS for... |
-|-------------------|-----------------|
-| Current UI state (loading, error) | HTTP streams |
-| Selected item, filter values | WebSocket event streams |
-| Derived/computed values | Combining multiple streams |
-| Synchronous, readable state | Operators: debounce, retry, switchMap |
-| Reading in templates | Cancellation (switchMap) |
-
-**Integration pattern used in this project:**
-
-```typescript
-// RxJS Observable (event stream) → Signal (state)
-this.websocketService
-  .connectOrder(orderId)                    // Observable<WebSocketEvent>
-  .pipe(
-    filter(e => e.event_type === 'OrderStatusChanged'),
-    takeUntilDestroyed()                    // Auto-cleanup
-  )
-  .subscribe(event => {
-    this.order.update(o => ({...o, status: event.status})); // Signal update
-  });
-```
-
-```typescript
-// In the template — reads Signal synchronously:
-{{ order().status }}   // ← Angular knows to re-render when order() changes
-```
-
-### Angular Lazy Loading
-
-```typescript
-// app.routes.ts
-{
-  path: 'orders',
-  loadComponent: () =>
-    import('./features/orders/pages/order-list/order-list.component')
-      .then(m => m.OrderListComponent)    // ← Dynamic import = separate JS chunk
-}
-```
-
-Without lazy loading: **all 5 feature chunks loaded on startup** (~400 KB extra).
-With lazy loading: each feature chunk loads **only when that route is visited**.
-
----
-
 ## API Reference
 
 | Method | Endpoint | Description |
@@ -352,108 +645,6 @@ With lazy loading: each feature chunk loads **only when that route is visited**.
 
 ---
 
-## End-to-End Demo Scenario
-
-### Step 1: Start everything
-
-```bash
-docker compose up --build
-# Wait ~60s for Kafka to be ready
-```
-
-### Step 2: Open the UI
-
-```
-http://localhost:4200
-```
-
-### Step 3: Open Kafka UI in a second tab
-
-```
-http://localhost:8080
-```
-Navigate to: **Topics → order.created → Messages**
-
-### Step 4: Create an order
-
-1. Click **"➕ New Order"** in the sidebar
-2. Enter Customer ID: `101`
-3. Add a product: `PROD-001`, quantity: `2`, price: `499.50`
-4. Click **"📦 Create Order"**
-5. You are redirected to the Order Detail page
-
-### Step 5: Watch real-time updates
-
-The Order Detail page shows:
-```
-Status: PENDING   → (1-2 seconds) → PROCESSING → (1-3 seconds) → COMPLETED
-```
-
-The status badge and progress bar update **automatically via WebSocket** without any page refresh.
-
-### Step 6: Observe Kafka messages
-
-In Kafka UI (http://localhost:8080), you should see:
-
-**`order.created`** topic — message published by the Outbox Worker:
-```json
-{
-  "event_id": "550e8400-...",
-  "event_type": "OrderCreated",
-  "event_version": 1,
-  "occurred_at": "2024-01-01T10:30:01Z",
-  "order_id": 1,
-  "customer_id": 101,
-  "total_amount": 999.00
-}
-```
-
-**`order.processed`** topic — published by Order Worker after COMPLETED:
-```json
-{
-  "event_id": "processed-550e8400-...",
-  "event_type": "OrderProcessed",
-  "order_id": 1
-}
-```
-
-**`notification.requested`** topic — published by Notification Worker:
-```json
-{
-  "event_type": "NotificationRequested",
-  "order_id": 1,
-  "channel": "email"
-}
-```
-
-### Step 7: Check consumer groups
-
-In Kafka UI → **Consumer Groups**:
-- `order-worker-group` — Order Worker offset
-- `notification-worker-group` — Notification Worker offset
-
-Both groups should show **lag = 0** (all messages consumed).
-
-### Step 8: Test the Event Timeline
-
-Click the **"⟳ Refresh"** button on the Order Detail page to see:
-```
-10:30:01  OrderCreated        status → PENDING
-10:30:02  ProcessingStarted   status → PROCESSING
-10:30:04  OrderCompleted      status → COMPLETED
-10:30:05  NotificationSent
-```
-
-### Step 9: Test retry flow
-
-1. Create another order
-2. Manually stop the order-worker: `docker compose stop order-worker`
-3. Create a new order — it will stay PENDING
-4. Restart: `docker compose start order-worker`
-5. The worker consumes the backlog and processes the order
-
----
-
 ## Running Tests
 
 ### Backend
@@ -461,24 +652,48 @@ Click the **"⟳ Refresh"** button on the Order Detail page to see:
 ```bash
 cd backend
 
-# Install deps (with aiosqlite for in-memory test DB)
-pip install -r requirements.txt aiosqlite
+# Install application and test dependencies
+pip install -r requirements-dev.txt
 
 # Run all tests
 pytest
 
-# With coverage
+# Run tests with coverage
 pytest --cov=app --cov-report=term-missing
 ```
+
+The backend test suite uses `aiosqlite` for the in-memory SQLite test database.
 
 ### Frontend
 
 ```bash
 cd frontend
+
+# Install dependencies from package-lock.json
 npm ci
-npm test                    # Run in headless Chrome
-npm run test:coverage       # With coverage report
+
+# Run unit tests
+npm test
+
+# Run tests with coverage
+npm run test:coverage
 ```
+
+### Test Coverage
+
+Backend coverage:
+
+```text
+pytest --cov=app --cov-report=term-missing
+```
+
+Frontend coverage:
+
+```text
+npm run test:coverage
+```
+
+Coverage reports help verify that the API, business logic, services, components, and other critical application paths are adequately tested.
 
 ---
 

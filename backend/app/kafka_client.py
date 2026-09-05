@@ -24,7 +24,7 @@ import json
 import logging
 from typing import Any
 
-from aiokafka import AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.errors import KafkaError
 
 from app.config import get_settings
@@ -36,6 +36,7 @@ settings = get_settings()
 TOPIC_ORDER_CREATED = "order.created"
 TOPIC_ORDER_PROCESSED = "order.processed"
 TOPIC_ORDER_FAILED = "order.failed"
+TOPIC_ORDER_STATUS_CHANGED = "order.status.changed"
 TOPIC_NOTIFICATION_REQUESTED = "notification.requested"
 TOPIC_ORDER_CREATED_DLQ = "order.created.dlq"
 
@@ -52,9 +53,7 @@ async def get_producer() -> AIOKafkaProducer:
             key_serializer=lambda k: str(k).encode("utf-8") if k else None,
             # acks="all" → leader + all in-sync replicas acknowledge before
             # the send() future resolves.  Safest durability setting.
-            acks="all",
-            # Retry up to 5 times on transient network errors.
-            retries=5,
+            acks="all"
         )
         await _producer.start()
     return _producer
@@ -65,6 +64,28 @@ async def close_producer() -> None:
     if _producer:
         await _producer.stop()
         _producer = None
+
+# group_id="order-websocket-broadcaster" - This consumer exists specifically to bridge Kafka events to WebSockets.
+async def create_status_consumer() -> AIOKafkaConsumer:
+    consumer = AIOKafkaConsumer(
+        TOPIC_ORDER_STATUS_CHANGED,
+        bootstrap_servers=settings.kafka_bootstrap_servers,
+        group_id="order-websocket-broadcaster",
+        auto_offset_reset="latest",
+        enable_auto_commit=True,
+        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+        key_deserializer=lambda k: k.decode("utf-8") if k else None,
+    )
+
+    await consumer.start()
+
+    logger.info(
+        "Kafka status consumer started: topic=%s group_id=%s",
+        TOPIC_ORDER_STATUS_CHANGED,
+        "order-websocket-broadcaster",
+    )
+
+    return consumer
 
 
 async def publish_event(

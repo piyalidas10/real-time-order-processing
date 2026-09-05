@@ -21,7 +21,7 @@ import {
 import { RouterLink } from '@angular/router';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { filter, tap } from 'rxjs';
-import { DatePipe } from '@angular/common';
+import { DatePipe, DecimalPipe } from '@angular/common';
 import { OrderStore } from '../../store/order.store';
 import { WebSocketService } from '../../../../core/services/websocket.service';
 import { StatusBadgePipe } from '../../../../shared/pipes/status.pipe';
@@ -31,7 +31,7 @@ import { OrderStatus } from '../../../../core/models/order.models';
   selector: 'app-order-list',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, StatusBadgePipe, DatePipe],
+  imports: [RouterLink, StatusBadgePipe, DatePipe, DecimalPipe],
   template: `
     <div class="page-header">
       <h1 class="page-title">📦 Orders</h1>
@@ -203,11 +203,35 @@ export class OrderListComponent implements OnInit {
     this.ws
       .connectGlobal()
       .pipe(
-        tap(() => this.wsConnected.set(true)),
-        filter((event) => event.event_type === 'OrderStatusChanged'),
         tap((event) => {
-          if (event.order_id && event.status) {
-            this.store.updateOrderStatus(event.order_id, event.status);
+          console.log('📡 RAW WEBSOCKET EVENT:', event);
+          this.wsConnected.set(true);
+        }),
+
+        filter((event) => {
+          const accepted = event.event_type === 'ProcessingStarted' || event.event_type === 'OrderCompleted' || event.event_type === 'OrderFailed';
+
+          console.log('🔎 EVENT FILTER:', {
+            event_type: event.event_type,
+            accepted,
+            order_id: event.order_id,
+            status: event.status,
+          });
+
+          return accepted;
+        }),
+
+        tap((event) => {
+          console.log('✅ UPDATING ORDER:', {
+            order_id: event.order_id,
+            status: event.status,
+          });
+
+          if (event.order_id != null && event.status) {
+            this.store.updateOrderStatus(
+              event.order_id,
+              event.status
+            );
           }
         }),
         takeUntilDestroyed()

@@ -18,17 +18,19 @@ import {
   signal,
 } from '@angular/core';
 import { RouterLink } from '@angular/router';
-import { catchError, EMPTY, tap } from 'rxjs';
+import { catchError, EMPTY, filter, tap } from 'rxjs';
 import { ApiService } from '../../core/services/api.service';
 import { DashboardStats, Order } from '../../core/models/order.models';
 import { StatusBadgePipe } from '../../shared/pipes/status.pipe';
-import { CurrencyPipe, DatePipe } from '@angular/common';
+import { DatePipe, DecimalPipe } from '@angular/common';
+import { WebSocketService } from '@core/services/websocket.service';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 
 @Component({
   selector: 'app-dashboard',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, StatusBadgePipe, CurrencyPipe, DatePipe],
+  imports: [RouterLink, StatusBadgePipe, DatePipe, DecimalPipe],
   template: `
     <div class="page-header">
       <h1 class="page-title">📊 Order Processing Dashboard</h1>
@@ -144,6 +146,7 @@ import { CurrencyPipe, DatePipe } from '@angular/common';
 })
 export class DashboardComponent implements OnInit {
   private readonly api = inject(ApiService);
+  private readonly ws = inject(WebSocketService);
 
   // ── Signals ────────────────────────────────────────────────────────────────
   // signal<T | null>(null) — initial null; set after HTTP response arrives
@@ -152,9 +155,16 @@ export class DashboardComponent implements OnInit {
   readonly error = signal<string | null>(null);
 
   ngOnInit(): void {
-    this.load();
+    // 1. Load initial dashboard state using REST 
+    this.load(); 
+    // 2. Listen for real-time order events
+    this.listenForOrderUpdates();
   }
 
+  /** 
+   * Initial / refreshed dashboard state.
+   * REST API remains the source of truth. 
+   */
   load(): void {
     this.loading.set(true);
     this.error.set(null);
@@ -163,6 +173,7 @@ export class DashboardComponent implements OnInit {
     // We subscribe once, update the signal with the result, then unsubscribe.
     // tap() is side-effect operator — runs the function without modifying the stream.
     // catchError() handles errors without crashing the stream.
+    // Initial page load GET /dashboard/stats to populate the dashboard.
     this.api
       .getDashboardStats()
       .pipe(
@@ -177,5 +188,60 @@ export class DashboardComponent implements OnInit {
         })
       )
       .subscribe();
+  }
+
+  /** 
+   * Listen to the global WebSocket.
+   * Every order event can potentially change
+   * dashboard statistics.
+   * 
+   * When OrderStatusChanged arrives: 
+   * 
+   * WebSocket
+   * ↓
+   * OrderStatusChanged
+   * ↓
+   * load()
+   * ↓
+   * GET /dashboard/stats
+   * ↓
+   * stats.set(...)
+   * ↓
+   * Angular UI updates
+   */
+  private listenForOrderUpdates(): void {
+  console.log('[Dashboard] Starting global WebSocket...');
+
+  this.ws
+    .connectGlobal()
+    .pipe(
+      tap(event => {
+        console.log('[Dashboard] WebSocket EVENT RECEIVED:', event);
+      }),
+      filter(
+        event =>
+          event.event_type === 'OrderCreated' ||
+          event.event_type === 'ProcessingStarted' ||
+          event.event_type === 'OrderCompleted' ||
+          event.event_type === 'OrderFailed'
+      ),
+      tap(event => {
+        console.log(
+          '[Dashboard] REFRESHING because of:',
+          event.event_type
+        );
+
+        this.load();
+      }),
+        takeUntilDestroyed()
+      )
+      .subscribe({
+        error: err => {
+          console.error('[Dashboard] WebSocket ERROR:', err);
+        },
+        complete: () => {
+          console.log('[Dashboard] WebSocket COMPLETED');
+        }
+      });
   }
 }

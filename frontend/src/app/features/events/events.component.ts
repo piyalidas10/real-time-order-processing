@@ -73,22 +73,24 @@ interface LiveEvent extends WebSocketEvent {
             </thead>
             <tbody>
               @for (event of liveEvents(); track event.receivedAt + event.order_id) {
-                <tr class="event-row event-{{ event.event_type?.toLowerCase() }}">
-                  <td class="text-muted">{{ event.receivedAt | date:'HH:mm:ss.SSS' }}</td>
-                  <td><strong>{{ event.event_type }}</strong></td>
-                  <td>
-                    @if (event.order_id) {
-                      <a [routerLink]="['/orders', event.order_id]" class="btn btn-secondary btn-sm">
-                        #{{ event.order_id }}
-                      </a>
-                    }
-                  </td>
-                  <td>
-                    @if (event.status) {
-                      <span [class]="event.status | statusBadge">{{ event.status }}</span>
-                    }
-                  </td>
-                </tr>
+                @if (event?.event_type) {
+                  <tr class="event-row event-{{ event.event_type.toLowerCase() }}">
+                    <td class="text-muted">{{ event.receivedAt | date:'HH:mm:ss.SSS' }}</td>
+                    <td><strong>{{ event.event_type }}</strong></td>
+                    <td>
+                      @if (event.order_id) {
+                        <a [routerLink]="['/orders', event.order_id]" class="btn btn-secondary btn-sm">
+                          #{{ event.order_id }}
+                        </a>
+                      }
+                    </td>
+                    <td>
+                      @if (event.status) {
+                        <span [class]="event.status | statusBadge">{{ event.status }}</span>
+                      }
+                    </td>
+                  </tr>
+                  }
               }
             </tbody>
           </table>
@@ -130,7 +132,7 @@ export class EventsComponent {
       .connectGlobal()
       .pipe(
         tap(() => this.wsConnected.set(true)),
-        filter((event) => event.event_type === 'OrderStatusChanged'),
+        filter((event) => event.event_type === 'ProcessingStarted' || event.event_type === 'OrderCompleted' || event.event_type === 'OrderFailed'),
         tap((event) => {
           const liveEvent: LiveEvent = {
             ...event,

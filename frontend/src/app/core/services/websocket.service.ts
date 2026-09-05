@@ -56,39 +56,57 @@ import { WebSocketEvent } from '../models/order.models';
  * 3. Errors when the socket closes unexpectedly
  * 4. Completes when the socket closes normally (code 1000)
  */
-function createWebSocketObservable(url: string): Observable<WebSocketEvent> {
-  return new Observable<WebSocketEvent>((subscriber) => {
-    const ws = new WebSocket(url);
+  function createWebSocketObservable(url: string): Observable<WebSocketEvent> {
+    return new Observable<WebSocketEvent>((subscriber) => {
+      const ws = new WebSocket(url);
 
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data) as WebSocketEvent;
-        subscriber.next(data);
-      } catch {
-        // Ignore malformed messages — don't crash the stream
-      }
-    };
+      ws.onopen = () => {
+        console.log(`[WS] OPEN: ${url}`);
+      };
 
-    ws.onerror = () => {
-      subscriber.error(new Error(`WebSocket error on ${url}`));
-    };
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data) as WebSocketEvent;
 
-    ws.onclose = (event) => {
-      if (event.code === 1000) {
-        subscriber.complete(); // Normal close
-      } else {
-        subscriber.error(new Error(`WebSocket closed: code=${event.code}`));
-      }
-    };
+          console.log('[WS] MESSAGE:', data);
 
-    // Teardown: close the socket when the Observable is unsubscribed
-    return () => {
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.close(1000, 'Unsubscribed');
-      }
-    };
-  });
-}
+          subscriber.next(data);
+        } catch (error) {
+          console.error('[WS] Invalid JSON:', event.data, error);
+        }
+      };
+
+      ws.onerror = (event) => {
+        console.error(`[WS] ERROR: ${url}`, event);
+        subscriber.error(new Error(`WebSocket error on ${url}`));
+      };
+
+      ws.onclose = (event) => {
+        console.warn(
+          `[WS] CLOSED: ${url}`,
+          `code=${event.code}`,
+          `reason=${event.reason}`
+        );
+
+        subscriber.error(
+          new Error(
+            `WebSocket closed: code=${event.code}, reason=${event.reason}`
+          )
+        );
+      };
+
+      return () => {
+        console.log(`[WS] TEARDOWN: ${url}`);
+
+        if (
+          ws.readyState === WebSocket.OPEN ||
+          ws.readyState === WebSocket.CONNECTING
+        ) {
+          ws.close(1000, 'Observable unsubscribed');
+        }
+      };
+    });
+  }
 
 @Injectable({ providedIn: 'root' })
 export class WebSocketService implements OnDestroy {
@@ -100,6 +118,13 @@ export class WebSocketService implements OnDestroy {
    *
    * Uses retry() with exponential back-off to reconnect on failure.
    * takeUntilDestroyed (via destroy$) ensures cleanup when the service is destroyed.
+   * 
+   * connectGlobal()
+      │
+      ▼
+    /ws/orders
+      │
+      └── ALL order events
    */
   connectGlobal(): Observable<WebSocketEvent> {
     const url = `${environment.wsBaseUrl}/ws/orders`;
@@ -109,6 +134,13 @@ export class WebSocketService implements OnDestroy {
   /**
    * Connect to a specific order's WebSocket channel.
    * Subscribe to this in the Order Detail page to get PROCESSING/COMPLETED events.
+   * 
+   * connectOrder(orderId)
+      │
+      ▼
+    /ws/orders/{id}
+      │
+      └── events for ONE order
    */
   connectOrder(orderId: number): Observable<WebSocketEvent> {
     const url = `${environment.wsBaseUrl}/ws/orders/${orderId}`;

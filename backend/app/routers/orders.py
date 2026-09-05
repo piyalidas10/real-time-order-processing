@@ -25,6 +25,7 @@ from app.schemas import (
     OrderListResponse,
     OrderResponse,
 )
+from app.websocket_manager import ws_manager
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -102,6 +103,21 @@ async def create_order(payload: OrderCreate, db: AsyncSession = Depends(get_db))
 
     await db.commit()
     await db.refresh(order)
+
+    # Notify connected WebSocket clients after the transaction commits.
+    # Broadcast OrderCreated to:
+    # 1. /ws/orders/{order_id}
+    # 2. /ws/orders
+    await ws_manager.broadcast_order_event(
+        order.id,
+        {
+            "event_type": "OrderCreated",
+            "order_id": order.id,
+            "status": OrderStatus.PENDING.value,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
     return order
 
 
