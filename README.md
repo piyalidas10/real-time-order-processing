@@ -242,91 +242,209 @@ docker compose up -d --build
 ```
 docker exec -it order-processing-system-postgres-1 psql -U orderuser -d orderdb -c "SELECT id, order_id, event_type, status, created_at FROM order_events WHERE order_id = 9 ORDER BY created_at;"
 ```
-
+```
  id | order_id |    event_type     |   status   |          created_at
 ----+----------+-------------------+------------+-------------------------------
  33 |        9 | OrderCreated      | PENDING    | 2026-09-05 13:27:39.237189+00
  34 |        9 | ProcessingStarted | PROCESSING | 2026-09-05 13:27:41.356493+00
  35 |        9 | OrderCompleted    | COMPLETED  | 2026-09-05 13:27:42.520761+00
 (3 rows)
+```
 
 ## After creating order -  your flow becomes:
-```
-                 CREATE ORDER
-                      │
-                      ▼
-              OrderCreated/PENDING
-                      │
-                      ▼
-                  Kafka
-                      │
-                      ▼
-              Background Worker
-                      │
-             ┌────────┴────────┐
-             ▼                 ▼
-        PostgreSQL         WebSocket
-             │                 │
-             │          ProcessingStarted
-             │          status=PROCESSING
-             │                 │
-             │                 ▼
-             │          Angular Signal
-             │                 │
-             │                 ▼
-             │          Progress = 50%
-             │
-             ▼
-          COMPLETED
-             │
-             ├──────────────► WebSocket
-             │                OrderCompleted
-             │                status=COMPLETED
-             │                     │
-             │                     ▼
-             │               Angular Signal
-             │                     │
-             │                     ▼
-             │               Progress = 100%
-```
-So the UI should visibly transition:
-> **PENDING → PROCESSING → COMPLETED**
 
-## Why your logs look different
-
-**For `outbox-worker`, you're seeing:**
+The Background Worker does not directly send to WebSocket. Your actual flow is:
 ```
+CREATE ORDER
+     │
+     ▼
+PostgreSQL
+     │
+     │ Transactional Outbox
+     ▼
+Outbox Worker
+     │
+     ▼
+Kafka: order.created
+     │
+     ▼
+Order Worker
+     │
+     ├──────────────► PostgreSQL
+     │                 PENDING → PROCESSING
+     │
+     └──────────────► Kafka: order.status.changed
+                              │
+                              ▼
+                    FastAPI WebSocket Bridge
+                              │
+                              ▼
+                       WebSocket
+                              │
+                              ▼
+                     Angular WebSocketService
+                              │
+                              ▼
+                       Angular Signal
+                              │
+                              ▼
+                       PROCESSING / 50%
+```
+Then completion:
+```
+Order Worker
+     │
+     ├──────────────► PostgreSQL
+     │                 PROCESSING → COMPLETED
+     │
+     └──────────────► Kafka: order.status.changed
+                              │
+                              ▼
+                    FastAPI WebSocket Bridge
+                              │
+                              ▼
+                       WebSocket
+                              │
+                              ▼
+                       Angular Signal
+                              │
+                              ▼
+                         COMPLETED
+                         Progress = 100%
+```
+So the user-visible behavior is exactly:
+```
+PENDING → PROCESSING → COMPLETED
+```
+One wording change I'd make
+
+Instead of:
+```
+Background Worker → PostgreSQL + WebSocket
+```
+use:
+```
+Order Worker → PostgreSQL + Kafka
+```
+and then:
+
+Kafka → WebSocket Bridge → WebSocket → Angular
+
+That's important for your interview explanation because it demonstrates process isolation and event-driven architecture.
+
+Final simplified flow
+```
+                    CREATE ORDER
+                         │
+                         ▼
+                PostgreSQL / PENDING
+                         │
+                  Transactional
+                     Outbox
+                         │
+                         ▼
+                    Outbox Worker
+                         │
+                         ▼
+                  Kafka: order.created
+                         │
+                         ▼
+                    Order Worker
+                         │
+              ┌──────────┴──────────┐
+              │                     │
+              ▼                     ▼
+         PostgreSQL           Kafka: status.changed
+     PENDING → PROCESSING            │
+              │                     ▼
+              │             WebSocket Bridge
+              │                     │
+              │                     ▼
+              │                 WebSocket
+              │                     │
+              │                     ▼
+              │              Angular Signal
+              │                     │
+              │                     ▼
+              │               50% PROCESSING
+              │
+              ▼
+         COMPLETED
+              │
+              └────────────► Kafka: status.changed
+                                    │
+                                    ▼
+                            WebSocket Bridge
+                                    │
+                                    ▼
+                               WebSocket
+                                    │
+                                    ▼
+                             Angular Signal
+                                    │
+                                    ▼
+                            100% COMPLETED
+```
+
+## Why Your Worker Logs Look Different
+
+### Outbox Worker
+
+For `outbox-worker`, you may see logs similar to:
+
+```text
 SELECT ... FROM outbox_events
 WHERE status = 'PENDING'
 ...
+
 ROLLBACK
 ```
-That is normal.
 
-**It means:**
-```
+This is normal.
+
+The Outbox Worker continuously checks PostgreSQL for pending outbox events:
+
+```text
 outbox-worker
-     ↓
-Check DB for PENDING events
-     ↓
-No new events
-     ↓
-sleep
-     ↓
-Check again
-     ↓
-No new events
-     ↓
-sleep
-     ↓
-...
+     │
+     ▼
+Check PostgreSQL for PENDING outbox events
+     │
+     ├── Event found
+     │      │
+     │      ▼
+     │   Publish event to Kafka
+     │      │
+     │      ▼
+     │   Mark outbox event as PROCESSED
+     │
+     └── No event
+            │
+            ▼
+          Sleep
+            │
+            ▼
+        Check again
+            │
+            ▼
+           ...
 ```
-So it should not stop.
 
-**`order-worker` is different**
+Therefore, seeing repeated database queries and occasional `ROLLBACK` messages does **not** mean that the worker has stopped.
 
-**You should see something like:**
-```
+When there are no new events to process, the worker simply waits and checks again.
+
+---
+
+### Order Worker
+
+The `order-worker` behaves differently.
+
+It is a Kafka consumer and normally waits for messages.
+
+During startup, you may see logs such as:
+
+```text
 Order worker started, waiting for messages...
 Subscribed to topic order.created
 Joined group 'order-worker-group'
@@ -334,181 +452,463 @@ Successfully synced group
 Setting newly assigned partitions...
 ```
 
-**And then it may appear to do nothing:**
-```
-Order worker started, waiting for messages...
-Joined group...
-Assigned partitions...
-```
-That's also normal.
+After that, the worker may appear to do nothing.
 
-**It is essentially doing:**
-```
+That is expected.
+
+The worker is essentially doing:
+
+```text
 order-worker
-     ↓
-WAIT for Kafka message
-     ↓
-WAIT...
-     ↓
-WAIT...
-     ↓
+     │
+     ▼
+Wait for Kafka message
+     │
+     ▼
+Wait...
+     │
+     ▼
+Wait...
+     │
+     ▼
 Kafka message arrives
-     ↓
-process order
-     ↓
-WAIT again
-     ↓
+     │
+     ▼
+Process order
+     │
+     ▼
+Update PostgreSQL
+     │
+     ▼
+Publish status event
+     │
+     ▼
+Wait for next Kafka message
+     │
+     ▼
 ...
 ```
 
-**It doesn't need to continuously print:**
-```
-Consuming...
-Consuming...
-Consuming...
-```
-unless you explicitly add logging for that.
+It does not need to continuously print:
 
-## Kafka → worker → PostgreSQL → frontend real-time update flow
+```text
+Consuming...
+Consuming...
+Consuming...
 ```
-Angular
-   │
-   │ POST /orders
-   ▼
+
+unless explicit logging has been added for every polling/consume cycle.
+
+---
+
+## Kafka → Worker → PostgreSQL → WebSocket → Angular
+
+The complete real-time flow in this application is:
+
+```text
+Angular 21
+    │
+    │ POST /api/v1/orders
+    ▼
 FastAPI
-   │
-   │ save order = PENDING
-   ▼
+    │
+    │ Create order + outbox event
+    ▼
 PostgreSQL
-   │
-   │ Outbox record
-   ▼
-Outbox Worker
-   │
-   │ Kafka event
-   ▼
-Kafka
-   │
-   ▼
-Order Worker
-   │
-   │ update DB
-   ▼
-PostgreSQL
-   │
-   │ PROCESSING / COMPLETED
-   ▼
-WebSocket / polling
-   │
-   ▼
-Angular
+    │
+    ├── orders = PENDING
+    │
+    └── outbox_events = PENDING
+              │
+              ▼
+        Outbox Worker
+              │
+              │ publish
+              ▼
+       Kafka: order.created
+              │
+              ▼
+        Order Worker
+              │
+       ┌──────┴──────┐
+       │             │
+       ▼             ▼
+ PostgreSQL       Kafka
+       │        order.status.changed
+       │             │
+       │             ▼
+       │      WebSocket Bridge
+       │             │
+       │             ▼
+       │         WebSocket
+       │             │
+       │             ▼
+       │       Angular RxJS
+       │             │
+       │             ▼
+       │       Angular Signal
+       │             │
+       │             ▼
+       │        UI updates
+       │
+       ▼
+PROCESSING → COMPLETED
 ```
 
 ## Architecture Overview
+
+```text
+                         Angular 21
+                             │
+                             │ POST /api/v1/orders
+                             ▼
+                         FastAPI API
+                             │
+                 ┌───────────┴───────────┐
+                 │                       │
+                 ▼                       ▼
+             orders                 outbox_events
+             PENDING                    PENDING
+                 │                       │
+                 │                       ▼
+                 │                 Outbox Worker
+                 │                       │
+                 │                       │ publish
+                 │                       ▼
+                 │                Kafka: order.created
+                 │                       │
+                 │                       ▼
+                 │                 Order Worker
+                 │                       │
+                 │              ┌────────┴────────┐
+                 │              │                 │
+                 │              ▼                 ▼
+                 │         PostgreSQL          Kafka
+                 │         PROCESSING      order.status.changed
+                 │              │                 │
+                 │              │                 ▼
+                 │              │        WebSocket Bridge
+                 │              │                 │
+                 │              │                 ▼
+                 │              │             WebSocket
+                 │              │                 │
+                 │              │                 ▼
+                 │              │            Angular RxJS
+                 │              │                 │
+                 │              │                 ▼
+                 │              │          Angular Signal
+                 │              │                 │
+                 │              │                 ▼
+                 │              │          UI: PROCESSING
+                 │              │
+                 │              ▼
+                 │          COMPLETED
+                 │              │
+                 │              └──────► Kafka: order.status.changed
+                 │                              │
+                 │                              ▼
+                 │                       WebSocket Bridge
+                 │                              │
+                 │                              ▼
+                 │                           Angular
+                 │                              │
+                 │                              ▼
+                 │                       UI: COMPLETED
+                 │
+                 └───────────────────────────────────────────
 ```
-Angular 21
-   │
-   │ POST /orders
-   ▼
-FastAPI
-   │
-   ├── orders → PENDING
-   └── outbox_events → PENDING
-                 │
-                 ▼
-           outbox-worker
-                 │
-                 ▼
-              Kafka
-          order.created
-                 │
-                 ▼
-           order-worker
-                 │
-       ┌─────────┴─────────┐
-       ▼                   ▼
-  PROCESSING           COMPLETED
-       │                   │
-       └─────────┬─────────┘
-                 ▼
-             PostgreSQL
-```
-**And your supporting tables give you:**
-```
+
+## Supporting Database Tables
+
+The application uses four important tables, each with a different responsibility:
+
+```text
 orders
-    └── current state
+   │
+   └── Current state of the order
+       Example:
+       PENDING
+       PROCESSING
+       COMPLETED
+
 
 order_events
-    └── state/event history
+   │
+   └── Order state/event history
+       Example:
+       OrderCreated
+       ProcessingStarted
+       OrderCompleted
+
 
 outbox_events
-    └── reliable Kafka publishing
+   │
+   └── Reliable event publishing
+       PostgreSQL → Outbox Worker → Kafka
+
 
 processed_events
-    └── idempotency / duplicate protection
+   │
+   └── Idempotency / duplicate-event protection
+       Prevents the same Kafka event
+       from being processed more than once
 ```
-<img src="img/DBeaver_DB_Table.png" width="90%" />
-<img src="img/DBeaver_DB_Table_Order_Completed.png" width="90%" />
+
+## Why This Architecture Is Important
+
+The system deliberately separates the responsibilities:
+
+| Component            | Responsibility                               |
+| -------------------- | -------------------------------------------- |
+| **Angular 21**       | User interface and real-time state updates   |
+| **FastAPI**          | REST API and WebSocket connections           |
+| **PostgreSQL**       | Durable application state                    |
+| **Outbox Worker**    | Reliable PostgreSQL → Kafka event publishing |
+| **Kafka**            | Asynchronous event transport                 |
+| **Order Worker**     | Order processing/business logic              |
+| **WebSocket Bridge** | Kafka → browser real-time delivery           |
+| **RxJS**             | WebSocket event stream                       |
+| **Angular Signals**  | Current UI state                             |
+| **order_events**     | Event/history tracking                       |
+| **processed_events** | Idempotency protection                       |
+
+### Final Real-Time Behavior
+
+When an order is created, the user should see:
+
+```text
+PENDING
+   │
+   │ Order Worker starts processing
+   ▼
+PROCESSING
+   │
+   │ Order processing completes
+   ▼
+COMPLETED
+```
+
+The browser does **not need to refresh the page**.
+
+The status changes are pushed through:
+
+```text
+Kafka
+  ↓
+WebSocket Bridge
+  ↓
+WebSocket
+  ↓
+RxJS
+  ↓
+Angular Signal
+  ↓
+UI
+```
+
+Therefore, the key demonstration of the application is:
+
+> **Create an order → PENDING → PROCESSING → COMPLETED, with the Angular UI updating automatically in real time.**
+
 
 ### Overall Architecture
 
 ```mermaid
 flowchart LR
-    Angular -->|REST POST /orders| FastAPI
-    Angular <-->|WebSocket /ws/orders/id| FastAPI
-    FastAPI -->|INSERT order + outbox event| PostgreSQL
-    PostgreSQL -->|Poll PENDING outbox events| OutboxWorker
-    OutboxWorker -->|Publish order.created| Kafka
-    Kafka -->|Consume order.created| OrderWorker
-    OrderWorker -->|UPDATE PROCESSING/COMPLETED| PostgreSQL
-    OrderWorker -->|Publish order.processed| Kafka
-    Kafka -->|Consume order.processed| NotificationWorker
-    FastAPI -->|broadcast_order_event| Angular
+
+    UI[Angular 21]
+
+    API[FastAPI]
+    DB[(PostgreSQL)]
+    OUTBOX[Outbox Worker]
+    K[Kafka]
+
+    OW[Order Worker]
+    BRIDGE[WebSocket Event Consumer / Bridge]
+
+    WS[WebSocket]
+    
+    UI -->|POST /api/v1/orders| API
+    API -->|INSERT order + outbox event| DB
+
+    API <-->|WebSocket /ws/orders/{id}| WS
+    WS --> UI
+
+    DB -->|Poll PENDING outbox events| OUTBOX
+    OUTBOX -->|Publish order.created| K
+
+    K -->|Consume order.created| OW
+
+    OW -->|UPDATE PENDING → PROCESSING → COMPLETED| DB
+
+    OW -->|Publish order.status.changed| K
+
+    K -->|Consume order.status.changed| BRIDGE
+
+    BRIDGE -->|broadcast_order_event| WS
 ```
 
 ### Event Flow Sequence
 
 ```mermaid
 sequenceDiagram
+
     participant UI as Angular 21
     participant API as FastAPI
     participant DB as PostgreSQL
     participant O as Outbox Worker
     participant K as Kafka
     participant W as Order Worker
-    participant N as Notification Worker
+    participant B as WebSocket Bridge
+    participant WS as WebSocket
 
     UI->>API: POST /api/v1/orders
+
     API->>DB: BEGIN TRANSACTION
     API->>DB: INSERT order (status=PENDING)
     API->>DB: INSERT outbox_event (status=PENDING)
     DB-->>API: COMMIT
+
     API-->>UI: 201 { status: "PENDING" }
 
-    Note over UI: Opens WebSocket /ws/orders/{id}
+    UI->>WS: Connect /ws/orders/{id}
+    WS-->>UI: Connected
 
-    O->>DB: SELECT * FROM outbox_events WHERE status='PENDING'
-    O->>K: Publish order.created (key=order_id)
-    O->>DB: UPDATE outbox_events SET status='PUBLISHED'
+    O->>DB: SELECT PENDING outbox_events
+    O->>K: Publish order.created
+    O->>DB: Mark outbox_event as PROCESSED
 
     K->>W: Consume order.created
-    W->>DB: Check processed_events (idempotency)
-    W->>DB: UPDATE orders SET status='PROCESSING'
-    W-->>UI: WebSocket { event_type: "OrderStatusChanged", status: "PROCESSING" }
 
-    Note over UI: Status badge updates: PENDING → PROCESSING
+    W->>DB: Check processed_events
+    W->>DB: UPDATE orders SET status='PROCESSING'
+
+    W->>K: Publish order.status.changed
+    Note over K: ProcessingStarted<br/>status=PROCESSING
+
+    K->>B: Consume order.status.changed
+    B->>WS: broadcast_order_event()
+
+    WS-->>UI: ProcessingStarted<br/>status=PROCESSING
+
+    Note over UI: PENDING → PROCESSING<br/>Progress = 50%
 
     W->>DB: UPDATE orders SET status='COMPLETED'
-    W->>K: Publish order.processed
 
-    W-->>UI: WebSocket { event_type: "OrderStatusChanged", status: "COMPLETED" }
+    W->>K: Publish order.status.changed
+    Note over K: OrderCompleted<br/>status=COMPLETED
 
-    Note over UI: Status badge updates: PROCESSING → COMPLETED
+    K->>B: Consume order.status.changed
+    B->>WS: broadcast_order_event()
 
-    K->>N: Consume order.processed
-    N->>DB: INSERT order_events (NotificationSent)
-    N->>K: Publish notification.requested
+    WS-->>UI: OrderCompleted<br/>status=COMPLETED
+
+    Note over UI: PROCESSING → COMPLETED<br/>Progress = 100%
 ```
+
+### Real-Time Status Flow
+
+The important part of the architecture is:
+
+```text
+Order Worker
+     │
+     │ status changed
+     ▼
+Kafka
+     │
+     │ order.status.changed
+     ▼
+WebSocket Bridge
+     │
+     │ broadcast_order_event()
+     ▼
+WebSocket
+     │
+     ▼
+Angular WebSocketService
+     │
+     │ RxJS Observable
+     ▼
+Angular Signal
+     │
+     ▼
+UI
+```
+
+The browser therefore transitions automatically:
+
+```text
+PENDING
+   │
+   │ ProcessingStarted
+   ▼
+PROCESSING
+   │
+   │ OrderCompleted
+   ▼
+COMPLETED
+```
+
+### Supporting Event Flow
+
+If the Notification Worker is part of the implemented application, it is a **separate downstream consumer** and should not be mixed into the primary real-time status path:
+
+```text
+Kafka
+  │
+  ├── order.created
+  │       └──► Order Worker
+  │
+  └── order.status.changed
+          └──► WebSocket Bridge
+                    └──► Angular
+
+Order Worker
+  │
+  └──► notification-related event
+            │
+            ▼
+       Notification Worker
+```
+
+This separation makes the architecture easier to explain:
+
+* **Outbox Worker** → reliably publishes database events to Kafka.
+* **Order Worker** → processes orders and changes their state.
+* **WebSocket Bridge** → converts Kafka status events into browser WebSocket messages.
+* **Angular** → receives events through RxJS and updates Signals/UI.
+* **Notification Worker** → handles notification-related processing independently.
+
+````
+
+### One particularly important interview point
+
+Your original diagram had:
+
+```text
+OrderWorker ──► WebSocket ──► Angular
+````
+
+Avoid showing that. The more accurate production-style architecture is:
+
+```text
+OrderWorker
+     │
+     ▼
+Kafka
+     │
+     ▼
+WebSocket Bridge
+     │
+     ▼
+WebSocket
+     │
+     ▼
+Angular
+```
+
+That distinction is actually **one of the strongest architectural points in your project**: the Order Worker and FastAPI are separate processes, so the worker cannot directly use FastAPI's in-memory `ws_manager`. Kafka becomes the cross-process event transport, while the WebSocket Bridge owns delivery to connected browsers.
 
 ### Database Schema
 
