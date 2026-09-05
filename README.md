@@ -731,7 +731,8 @@ flowchart LR
     UI -->|POST /api/v1/orders| API
     API -->|INSERT order + outbox event| DB
 
-    API <-->|WebSocket /ws/orders/{id}| WS
+    UI -->|Connect to WebSocket| WS
+    API -->|Owns WebSocket connections| WS
     WS --> UI
 
     DB -->|Poll PENDING outbox events| OUTBOX
